@@ -11,19 +11,22 @@ import java.util.*
 import java.util.concurrent.Executors
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
-
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 @Service
 class PaymentSystemImpl(
     private val paymentAccounts: List<PaymentExternalSystemAdapter>
 ) : PaymentService {
-    companion object {
-        val logger = LoggerFactory.getLogger(PaymentSystemImpl::class.java)
-    }
+
+    private val scope = CoroutineScope(Dispatchers.IO)
 
     override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         for (account in paymentAccounts) {
-            account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
+            scope.launch {
+                account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
+            }
         }
     }
 }
