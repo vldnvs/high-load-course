@@ -65,7 +65,7 @@ class PaymentExternalSystemAdapterImpl(
     )
 
 
-    private val semaphore = Semaphore(parallelRequests, true)
+    private val semaphore = Semaphore(parallelRequests)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
