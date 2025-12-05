@@ -102,10 +102,6 @@ class APIController {
 
         val now = Instant.now().toEpochMilli()
 
-        guard.check(deadline, now, 20) {
-            retryCounter.increment()
-        }
-
         orderRepository.save(order.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
 
         val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
