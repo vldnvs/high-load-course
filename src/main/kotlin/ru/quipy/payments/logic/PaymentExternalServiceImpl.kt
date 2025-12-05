@@ -84,8 +84,6 @@ class PaymentExternalSystemAdapterImpl(
             semaphore.acquire()
             try {
 
-                throwIfTooManyRequests();
-
                 val request = Request.Builder()
                     .url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                     .post(emptyBody)
