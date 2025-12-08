@@ -14,7 +14,7 @@ import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
-import java.util.UUID
+import java.util.*
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import kotlin.math.pow
@@ -27,17 +27,13 @@ class PaymentExternalSystemAdapterImpl(
 ) : PaymentExternalSystemAdapter {
 
     companion object {
-        val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
-
-        val emptyBody = RequestBody.create(null, ByteArray(0))
-        val mapper = ObjectMapper().registerKotlinModule()
+        private val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
+        private val emptyBody = RequestBody.create(null, ByteArray(0))
+        private val mapper = ObjectMapper().registerKotlinModule()
     }
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
-    private val requestAverageProcessingTime = properties.averageProcessingTime
-    private val rateLimitPerSec = properties.rateLimitPerSec
-    private val parallelRequests = properties.parallelRequests
 
     private val semaphore = Semaphore(properties.parallelRequests)
 
@@ -73,6 +69,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val maxAttempts = 3
 
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
@@ -85,6 +82,7 @@ class PaymentExternalSystemAdapterImpl(
 
         while (attempt < maxAttempts) {
             attempt++
+
             if (attempt > 1) paymentRetryCounter.increment()
 
             if (isDeadlineExpired(deadline)) {
@@ -92,14 +90,10 @@ class PaymentExternalSystemAdapterImpl(
                 return
             }
 
-            val success = executePaymentAttempt(
-                paymentId = paymentId,
-                transactionId = transactionId,
-                amount = amount,
-                deadline = deadline
-            )
+            val success = executePaymentAttempt(paymentId, transactionId, amount, deadline)
 
             if (success) return
+
             if (attempt == maxAttempts) {
                 failWithReason(paymentId, transactionId, "All $maxAttempts attempts failed")
                 return
@@ -114,6 +108,7 @@ class PaymentExternalSystemAdapterImpl(
             Thread.sleep(delay)
         }
     }
+
 
     private fun executePaymentAttempt(
         paymentId: UUID,
@@ -136,6 +131,7 @@ class PaymentExternalSystemAdapterImpl(
             }
 
             val success = executeHttpCall(paymentId, transactionId, request, deadline)
+
             semaphore.release()
             success
         } catch (e: SocketTimeoutException) {
@@ -148,6 +144,7 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
+
     private fun executeHttpCall(
         paymentId: UUID,
         transactionId: UUID,
@@ -155,6 +152,7 @@ class PaymentExternalSystemAdapterImpl(
         deadline: Long
     ): Boolean {
         val startTime = now()
+
         return try {
             val timeoutMs = minOf(timeoutTime.toLong(), deadline - startTime)
 
@@ -172,16 +170,17 @@ class PaymentExternalSystemAdapterImpl(
                 if (body.result) {
                     paymentSuccessCounter.increment()
                     logProcessingSuccess(paymentId, transactionId, body.message)
-                    true
+                    return true
                 } else {
                     handleErrorResponse(paymentId, transactionId, response.code, body.message)
-                    false
+                    return false
                 }
             }
         } finally {
             requestLatency.record(now() - startTime, TimeUnit.MILLISECONDS)
         }
     }
+
 
     private fun handleErrorResponse(paymentId: UUID, transactionId: UUID, code: Int, message: String?) {
         paymentErrorCounter.increment()
@@ -191,6 +190,7 @@ class PaymentExternalSystemAdapterImpl(
             logProcessingFailure(paymentId, transactionId, message)
         }
     }
+
 
     private fun parseExternalResponse(response: okhttp3.Response): ExternalSysResponse {
         return try {
@@ -203,6 +203,7 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
+
     private fun buildRequest(paymentId: UUID, transactionId: UUID, amount: Int): Request =
         Request.Builder()
             .url(
@@ -213,44 +214,68 @@ class PaymentExternalSystemAdapterImpl(
             .post(emptyBody)
             .build()
 
+
     private fun tryConsumeRateLimit(deadline: Long): Boolean {
         val remaining = deadline - now()
         return slidingWindowRateLimiter.tickBlocking(Duration.ofMillis(remaining))
     }
 
-    private fun isDeadlineExpired(deadline: Long) =
-        now() > deadline
+    private fun isDeadlineExpired(deadline: Long) = now() > deadline
 
     private fun logSubmission(paymentId: UUID, startedAt: Long, txId: UUID) {
         paymentESService.update(paymentId) {
-            it.logSubmission(success = true, txId, now(), Duration.ofMillis(now() - startedAt))
+            it.logSubmission(
+                success = true,
+                transactionId = txId,
+                startedAt = startedAt,
+                spentInQueueDuration = Duration.ofMillis(now() - startedAt)
+            )
         }
     }
 
     private fun logProcessingSuccess(paymentId: UUID, txId: UUID, message: String?) {
         paymentESService.update(paymentId) {
-            it.logProcessing(true, now(), txId, reason = message)
+            it.logProcessing(
+                success = true,
+                processedAt = now(),
+                transactionId = txId,
+                reason = message
+            )
         }
     }
 
     private fun logProcessingFailure(paymentId: UUID, txId: UUID, message: String?) {
         paymentESService.update(paymentId) {
-            it.logProcessing(false, now(), txId, reason = message)
+            it.logProcessing(
+                success = false,
+                processedAt = now(),
+                transactionId = txId,
+                reason = message
+            )
         }
     }
 
     private fun failWithReason(paymentId: UUID, txId: UUID, reason: String) {
         paymentErrorCounter.increment()
         paymentESService.update(paymentId) {
-            it.logProcessing(false, now(), txId, reason)
+            it.logProcessing(
+                success = false,
+                processedAt = now(),
+                transactionId = txId,
+                reason = reason
+            )
         }
     }
+
 
     private fun exponentialBackoffDelay(attempt: Int): Long {
         val maxDelayMs = 2000L
         val delayBaseMs = 200L
 
-        return minOf((delayBaseMs * 2.0.pow(attempt - 1)).toLong(), maxDelayMs)
+        return minOf(
+            (delayBaseMs * 2.0.pow(attempt - 1)).toLong(),
+            maxDelayMs
+        )
     }
 
 
