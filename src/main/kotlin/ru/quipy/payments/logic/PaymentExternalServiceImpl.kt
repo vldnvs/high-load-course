@@ -20,8 +20,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
 import kotlin.math.pow
-import kotlin.text.toLong
-import kotlin.times
+
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -36,32 +35,44 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private val semaphore = java.util.concurrent.Semaphore(properties.parallelRequests)
-
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
-    private val requestAverageProcessingTime = properties.averageProcessingTime
-    private val rateLimitPerSec = properties.rateLimitPerSec
-    private val parallelRequests = properties.parallelRequests
 
-    private val maxAttempts = 10
-    private val maxDelayMs = 20000L
-    private val delayBaseMs = 500L
+    private val paymentSuccessCounter = Counter.builder("payment_requests_processed_total")
+        .tag("outcome", "success")
+        .register(Metrics.globalRegistry)
+
+    private val paymentErrorCounter = Counter.builder("payment_requests_processed_total")
+        .tag("outcome", "error")
+        .register(Metrics.globalRegistry)
+
+    private val requestLatency = Timer.builder("payment_request_latency_seconds")
+        .tags("adapter", "payment")
+        .publishPercentiles(0.5, 0.85, 0.9, 0.95, 0.99)
+        .register(Metrics.globalRegistry)
+
+    private val paymentRetryCounter = Counter.builder("payment_requests_retries_total")
+        .tag("adapter", "payment")
+        .register(Metrics.globalRegistry)
 
     private val client = HttpClient.newBuilder()
         .executor(Executors.newFixedThreadPool(100))
         .version(HttpClient.Version.HTTP_2)
         .build()
 
-    val timeoutTime = properties.averageProcessingTime.toMillis() * 2
-
     val slidingWindowRateLimiter = SlidingWindowRateLimiter(
         rate = properties.rateLimitPerSec.toLong(),
         window = Duration.ofSeconds(1)
     )
+    private val requestAverageProcessingTime = properties.averageProcessingTime
+    private val maxAttempts = 10
+    private val maxDelayMs = 20000L
+    private val delayBaseMs = 500L
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
         val transactionId = UUID.randomUUID()
+
 
         paymentESService.update(paymentId) {
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
@@ -79,7 +90,7 @@ class PaymentExternalSystemAdapterImpl(
         attempt: Int
     ) {
         if (now() + requestAverageProcessingTime.toMillis() > deadline || attempt > maxAttempts) {
-
+            paymentErrorCounter.increment()
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded or max attempts reached")
             }
@@ -87,7 +98,7 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         if (!slidingWindowRateLimiter.tickBlocking(Duration.ofMillis(deadline - now()))) {
-
+            paymentErrorCounter.increment()
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "Rate limit exceed")
             }
@@ -96,10 +107,9 @@ class PaymentExternalSystemAdapterImpl(
 
         val timeToBlock = deadline - System.currentTimeMillis()
         val acquired = semaphore.tryAcquire(timeToBlock, TimeUnit.MILLISECONDS)
-
         if (!acquired) {
             logger.warn("[$accountName] Timeout acquiring semaphore for payment $paymentId")
-
+            paymentErrorCounter.increment()
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "Semaphore timeout")
             }
@@ -120,19 +130,30 @@ class PaymentExternalSystemAdapterImpl(
                 ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
             }
             logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+            requestLatency.record(now() - startTime, TimeUnit.MILLISECONDS)
 
-
+            // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+            // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
             paymentESService.update(paymentId) {
                 it.logProcessing(body.result, now(), transactionId, reason = body.message)
             }
 
             if (body.result) {
+                paymentSuccessCounter.increment()
                 semaphore.release()
-            }
-            else {
+            } else {
+                paymentErrorCounter.increment()
+                if (attempt > 1) {
+                    paymentRetryCounter.increment()
+                }
                 semaphore.release()
-
-                performPaymentWithDelay(attempt, deadline, paymentId, amount, transactionId, paymentStartedAt)
+                val currentDelay = exponentialBackoffDelay(attempt)
+                val remainingTime = deadline - now()
+                val sleepTime = min(currentDelay, remainingTime - 50)
+                if (sleepTime > 0) {
+                    Thread.sleep(sleepTime)
+                    performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
+                }
             }
 
         }.exceptionally { ex ->
@@ -150,9 +171,21 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
-
-            performPaymentWithDelay(attempt, deadline, paymentId, amount, transactionId, paymentStartedAt)
+            if (attempt > 1) {
+                paymentRetryCounter.increment()
+            }
+            val currentDelay = exponentialBackoffDelay(attempt)
+            val remainingTime = deadline - now()
+            val sleepTime = min(currentDelay, remainingTime - 50)
+            if (sleepTime > 0) {
+                Thread.sleep(sleepTime)
+                performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
+            }
         }
+    }
+
+    private fun exponentialBackoffDelay(attempt: Int): Long {
+        return minOf((delayBaseMs * 2.0.pow((attempt - 1).toDouble())).toLong(), maxDelayMs)
     }
 
     override fun price() = properties.price
@@ -160,27 +193,6 @@ class PaymentExternalSystemAdapterImpl(
     override fun isEnabled() = properties.enabled
 
     override fun name() = properties.accountName
-
-    private fun exponentialBackoffDelay(attempt: Int): Long {
-        return minOf((delayBaseMs * 2.0.pow((attempt - 1).toDouble())).toLong(), maxDelayMs)
-    }
-
-    private fun PaymentExternalSystemAdapterImpl.performPaymentWithDelay(
-        attempt: Int,
-        deadline: Long,
-        paymentId: UUID,
-        amount: Int,
-        transactionId: UUID,
-        paymentStartedAt: Long
-    ) {
-        val currentDelay = exponentialBackoffDelay(attempt)
-        val remainingTime = deadline - now()
-        val sleepTime = min(currentDelay, remainingTime - 50)
-        if (sleepTime > 0) {
-            Thread.sleep(sleepTime)
-            performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
-        }
-    }
 }
 
 public fun now() = System.currentTimeMillis()
