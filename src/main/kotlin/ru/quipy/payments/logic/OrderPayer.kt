@@ -45,15 +45,17 @@ class OrderPayer {
         CallerBlockingRejectedExecutionHandler()
     )
 
-    private val slidingWindowRateLimiter = SlidingWindowRateLimiter(8, Duration.ofSeconds(1))
+    private val slidingWindowRateLimiter = SlidingWindowRateLimiter(8, Duration.ofMillis(1200))
 
     private val queueSizeSummary = DistributionSummary.builder("payment_executor_queue_size")
         .tag("component", "order-payer")
         .register(Metrics.globalRegistry)
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
+
         val createdAt = System.currentTimeMillis()
         val toBlock = deadline - createdAt
+
         if (!slidingWindowRateLimiter.tickBlocking(Duration.ofMillis(toBlock))) {
             throw RateLimitException()
         }
