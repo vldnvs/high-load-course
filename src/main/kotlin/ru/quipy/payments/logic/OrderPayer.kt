@@ -44,11 +44,6 @@ class OrderPayer {
     )
 
     private val slidingWindowRateLimiter = SlidingWindowRateLimiter(8, Duration.ofSeconds(1))
-    init {
-        Gauge.builder("payment_executor_queue_size") { queue.size.toDouble() }
-            .tag("component", "order-payer")
-            .register(Metrics.globalRegistry)
-    }
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
