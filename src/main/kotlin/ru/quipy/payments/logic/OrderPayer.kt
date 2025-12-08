@@ -43,7 +43,7 @@ class OrderPayer {
         CallerBlockingRejectedExecutionHandler()
     )
 
-    private val slidingWindowRateLimiter = SlidingWindowRateLimiter(8, Duration.ofSeconds(1))
+    private val slidingWindowRateLimiter = SlidingWindowRateLimiter(100, Duration.ofSeconds(1))
     init {
         Gauge.builder("payment_executor_queue_size") { queue.size.toDouble() }
             .tag("component", "order-payer")

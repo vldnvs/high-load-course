@@ -68,7 +68,7 @@ class PaymentExternalSystemAdapterImpl(
 
     val slidingWindowRateLimiter = SlidingWindowRateLimiter(
         rate = properties.rateLimitPerSec.toLong(),
-        window = Duration.ofSeconds(1)
+        window = properties.averageProcessingTime
     )
 
     private val maxAttempts = 3
@@ -84,7 +84,7 @@ class PaymentExternalSystemAdapterImpl(
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         var attempt = 0
-        var currentDelay = 200L
+        var currentDelay = 500L
 
         while (attempt < maxAttempts) {
             attempt++
@@ -210,8 +210,8 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private fun exponentialBackoffDelay(attempt: Int): Long {
-        val maxDelayMs = 2000L
-        val delayBaseMs = 200L
+        val maxDelayMs = 20000L
+        val delayBaseMs = 500L
 
         return minOf((delayBaseMs * 2.0.pow((attempt - 1).toDouble())).toLong(), maxDelayMs)
     }
