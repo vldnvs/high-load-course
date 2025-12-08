@@ -3,7 +3,10 @@ package ru.quipy.apigateway
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.http.HttpStatus
+import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
+import ru.quipy.common.utils.RateLimitException
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
 import java.util.*
@@ -55,16 +58,36 @@ class APIController {
     }
 
     @PostMapping("/orders/{orderId}/payment")
-    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): PaymentSubmissionDto {
+    fun payOrder(
+        @PathVariable orderId: UUID,
+        @RequestParam deadline: Long
+    ): ResponseEntity<PaymentSubmissionDto> {
+
+        val order = orderRepository.findById(orderId)
+            ?: throw IllegalArgumentException("No such order $orderId")
+
+        orderRepository.save(order.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
+
         val paymentId = UUID.randomUUID()
-        val order = orderRepository.findById(orderId)?.let {
-            orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
-            it
-        } ?: throw IllegalArgumentException("No such order $orderId")
 
+        return submitPayment(orderId, order.price, paymentId, deadline)
+    }
 
-        val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
-        return PaymentSubmissionDto(createdAt, paymentId)
+    private fun submitPayment(
+        orderId: UUID,
+        price: Int,
+        paymentId: UUID,
+        deadline: Long
+    ): ResponseEntity<PaymentSubmissionDto> {
+
+        return try {
+            val createdAt = orderPayer.processPayment(orderId, price, paymentId, deadline)
+            ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
+        } catch (e: RateLimitException) {
+            ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                .header("Retry-After", "1")
+                .build()
+        }
     }
 
     class PaymentSubmissionDto(
