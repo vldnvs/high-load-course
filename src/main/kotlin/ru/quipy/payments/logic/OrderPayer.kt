@@ -35,7 +35,7 @@ class OrderPayer {
 
     private val paymentExecutor = ThreadPoolExecutor(
         100,
-        100,
+        1200,
         60L,
         TimeUnit.SECONDS,
         queue,
@@ -43,7 +43,7 @@ class OrderPayer {
         CallerBlockingRejectedExecutionHandler()
     )
 
-    private val slidingWindowRateLimiter = SlidingWindowRateLimiter(100, Duration.ofSeconds(1))
+    private val slidingWindowRateLimiter = SlidingWindowRateLimiter(1100, Duration.ofSeconds(1))
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
