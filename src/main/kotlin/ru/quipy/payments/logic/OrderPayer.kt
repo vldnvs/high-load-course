@@ -34,21 +34,16 @@ class OrderPayer {
     private val queue = LinkedBlockingQueue<Runnable>(8_000)
 
     private val paymentExecutor = ThreadPoolExecutor(
-        16,
-        16,
-        0L,
-        TimeUnit.MILLISECONDS,
+        100,
+        100,
+        60L,
+        TimeUnit.SECONDS,
         queue,
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
 
     private val slidingWindowRateLimiter = SlidingWindowRateLimiter(100, Duration.ofSeconds(1))
-    init {
-        Gauge.builder("payment_executor_queue_size") { queue.size.toDouble() }
-            .tag("component", "order-payer")
-            .register(Metrics.globalRegistry)
-    }
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
