@@ -7,7 +7,7 @@ Content-Type: application/json
   "serviceName": "{{serviceName}}",
   "token": "{{token}}",
   "branch": "hw-10-test",
-  "accounts": "acc-13,acc-20",
+  "accounts": "acc-13",
   "ratePerSecond": 4000,
   "testCount": 1500000,
   "processingTimeMillis": 1000,
@@ -16,4 +16,4 @@ Content-Type: application/json
 
 ### Stop running test to save credits
 # @timeout 120
-POST http://77.234.215.138:31234/test/stop/{{serviceName}}
+POST http://77.234.215.138:31234/test/stop/m3402-SkibidiToilets

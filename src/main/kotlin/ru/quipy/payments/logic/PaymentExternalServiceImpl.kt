@@ -67,9 +67,10 @@ class PaymentExternalSystemAdapterImpl(
         window = Duration.ofSeconds(1)
     )
     private val requestAverageProcessingTime = properties.averageProcessingTime
-    private val maxAttempts = 10
-    private val maxDelayMs = 20000L
-    private val delayBaseMs = 500L
+    private val maxAttempts = 3
+    private val maxDelayMs = 1500L
+    private val delayBaseMs = 100L
+    private val semaphoreAcquireTimeoutMs = 50L
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -107,7 +108,16 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        val timeToBlock = deadline - System.currentTimeMillis()
+        val remainingTime = deadline - System.currentTimeMillis()
+        val timeToBlock = min(semaphoreAcquireTimeoutMs, remainingTime)
+        if (timeToBlock <= 0) {
+            paymentErrorCounter.increment()
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded before semaphore")
+            }
+            return
+        }
+
         val acquired = semaphore.tryAcquire(timeToBlock, TimeUnit.MILLISECONDS)
         if (!acquired) {
             logger.warn("[$accountName] Timeout acquiring semaphore for payment $paymentId")
@@ -125,10 +135,11 @@ class PaymentExternalSystemAdapterImpl(
 
         val startTime = now()
         client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).thenApply { response ->
+            val statusCode = response.statusCode()
             val body = try {
                 mapper.readValue(response.body(), ExternalSysResponse::class.java)
             } catch (e: Exception) {
-                logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}")
+                logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: $statusCode, reason: ${response.body()}")
                 ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
             }
             logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
@@ -149,7 +160,10 @@ class PaymentExternalSystemAdapterImpl(
                     paymentRetryCounter.increment()
                 }
                 semaphore.release()
-                scheduleRetryWithBackoff(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt)
+                val shouldRetry = statusCode == 429 || statusCode in 500..504
+                if (shouldRetry) {
+                    scheduleRetryWithBackoff(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt)
+                }
             }
 
         }.exceptionally { ex ->
