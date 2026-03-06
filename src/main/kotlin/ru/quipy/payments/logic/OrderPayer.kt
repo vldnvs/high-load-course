@@ -5,6 +5,7 @@ import io.micrometer.core.instrument.Metrics
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Service
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.NamedThreadFactory
@@ -31,7 +32,10 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    private val queue = LinkedBlockingQueue<Runnable>(8_000)
+    @Value("\${payment.submission-rate-limit-per-sec:4000}")
+    private var submissionRateLimitPerSec: Long = 4000
+
+    private val queue = LinkedBlockingQueue<Runnable>(100_000)
 
     private val paymentExecutor = ThreadPoolExecutor(
         200,
@@ -43,7 +47,9 @@ class OrderPayer {
         CallerBlockingRejectedExecutionHandler()
     )
 
-    private val slidingWindowRateLimiter = SlidingWindowRateLimiter(1100, Duration.ofSeconds(1))
+    private val slidingWindowRateLimiter by lazy {
+        SlidingWindowRateLimiter(submissionRateLimitPerSec, Duration.ofSeconds(1))
+    }
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()

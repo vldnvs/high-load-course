@@ -17,6 +17,7 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
 import kotlin.math.pow
@@ -59,6 +60,7 @@ class PaymentExternalSystemAdapterImpl(
         .executor(Executors.newFixedThreadPool(100))
         .version(HttpClient.Version.HTTP_2)
         .build()
+    private val retryScheduler: ScheduledExecutorService = Executors.newScheduledThreadPool(32)
 
     val slidingWindowRateLimiter = SlidingWindowRateLimiter(
         rate = properties.rateLimitPerSec.toLong(),
@@ -147,13 +149,7 @@ class PaymentExternalSystemAdapterImpl(
                     paymentRetryCounter.increment()
                 }
                 semaphore.release()
-                val currentDelay = exponentialBackoffDelay(attempt)
-                val remainingTime = deadline - now()
-                val sleepTime = min(currentDelay, remainingTime - 50)
-                if (sleepTime > 0) {
-                    Thread.sleep(sleepTime)
-                    performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
-                }
+                scheduleRetryWithBackoff(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt)
             }
 
         }.exceptionally { ex ->
@@ -171,21 +167,37 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+            semaphore.release()
             if (attempt > 1) {
                 paymentRetryCounter.increment()
             }
-            val currentDelay = exponentialBackoffDelay(attempt)
-            val remainingTime = deadline - now()
-            val sleepTime = min(currentDelay, remainingTime - 50)
-            if (sleepTime > 0) {
-                Thread.sleep(sleepTime)
-                performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
-            }
+            scheduleRetryWithBackoff(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt)
+            null
         }
     }
 
     private fun exponentialBackoffDelay(attempt: Int): Long {
         return minOf((delayBaseMs * 2.0.pow((attempt - 1).toDouble())).toLong(), maxDelayMs)
+    }
+
+    private fun scheduleRetryWithBackoff(
+        paymentId: UUID,
+        amount: Int,
+        transactionId: UUID,
+        paymentStartedAt: Long,
+        deadline: Long,
+        attempt: Int
+    ) {
+        val currentDelay = exponentialBackoffDelay(attempt)
+        val remainingTime = deadline - now()
+        val sleepTime = min(currentDelay, remainingTime - 50)
+        if (sleepTime > 0) {
+            retryScheduler.schedule(
+                { performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1) },
+                sleepTime,
+                TimeUnit.MILLISECONDS
+            )
+        }
     }
 
     override fun price() = properties.price
