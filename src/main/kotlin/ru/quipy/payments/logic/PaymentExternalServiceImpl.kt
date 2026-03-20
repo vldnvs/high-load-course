@@ -2,6 +2,9 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
@@ -90,6 +93,21 @@ class PaymentExternalSystemAdapterImpl(
     private val maxHedgeRequests = 6
     private val hedgeTimeoutReserveMs = 50L
     private val hedgedRequestEnabled = requestAverageProcessingTime.toMillis() >= 1_000L
+    private val circuitBreakerRetryDelayMs = 250L
+
+    private val circuitBreaker: CircuitBreaker = CircuitBreaker.of(
+        "payment-cb-$accountName",
+        CircuitBreakerConfig.custom()
+            .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.TIME_BASED)
+            .slidingWindowSize(5)
+            .minimumNumberOfCalls(20)
+            .failureRateThreshold(10f)
+            .slowCallRateThreshold(10f)
+            .slowCallDurationThreshold(Duration.ofMillis(500))
+            .waitDurationInOpenState(Duration.ofMillis(1_000))
+            .permittedNumberOfCallsInHalfOpenState(5)
+            .build()
+    )
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -113,6 +131,11 @@ class PaymentExternalSystemAdapterImpl(
     ) {
         if (hedgedRequestEnabled && attempt == 1) {
             performHedgedRequest(paymentId, amount, transactionId, deadline)
+            return
+        }
+
+        if (!circuitBreaker.tryAcquirePermission()) {
+            retryWhenCircuitOpen(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt)
             return
         }
 
@@ -149,6 +172,7 @@ class PaymentExternalSystemAdapterImpl(
 
         val startTime = now()
         val permitReleased = AtomicBoolean(false)
+        val requestStart = now()
         client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).thenApply { response ->
             val body = try {
                 mapper.readValue(response.body(), ExternalSysResponse::class.java)
@@ -158,6 +182,7 @@ class PaymentExternalSystemAdapterImpl(
             }
             logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
             requestLatency.record(now() - startTime, TimeUnit.MILLISECONDS)
+            registerCircuitBreakerResult(body.result, now() - requestStart, null)
 
             // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
             // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
@@ -184,6 +209,7 @@ class PaymentExternalSystemAdapterImpl(
             }
 
         }.exceptionally { ex ->
+            registerCircuitBreakerResult(false, now() - requestStart, ex)
             when (ex) {
                 is SocketTimeoutException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", ex)
@@ -291,6 +317,7 @@ class PaymentExternalSystemAdapterImpl(
         completed: AtomicBoolean,
         released: AtomicBoolean
     ) {
+        val requestStart = now()
         client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).thenApply { response ->
             val body = try {
                 mapper.readValue(response.body(), ExternalSysResponse::class.java)
@@ -298,6 +325,7 @@ class PaymentExternalSystemAdapterImpl(
                 logger.error("[$accountName] [ERROR] Hedged payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}")
                 ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
             }
+            registerCircuitBreakerResult(body.result, now() - requestStart, null)
 
             if (body.result && completed.compareAndSet(false, true)) {
                 paymentSuccessCounter.increment()
@@ -309,8 +337,39 @@ class PaymentExternalSystemAdapterImpl(
             releasePermitOnce(released)
         }.exceptionally { ex ->
             logger.error("[$accountName] Hedged payment failed for txId: $transactionId, payment: $paymentId", ex)
+            registerCircuitBreakerResult(false, now() - requestStart, ex)
             releasePermitOnce(released)
             null
+        }
+    }
+
+    private fun retryWhenCircuitOpen(
+        paymentId: UUID,
+        amount: Int,
+        transactionId: UUID,
+        paymentStartedAt: Long,
+        deadline: Long,
+        attempt: Int
+    ) {
+        val remainingTime = deadline - now()
+        if (remainingTime <= circuitBreakerRetryDelayMs) {
+            paymentErrorCounter.increment()
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Circuit breaker open")
+            }
+            return
+        }
+
+        paymentRetryCounter.increment()
+        Thread.sleep(circuitBreakerRetryDelayMs)
+        performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt)
+    }
+
+    private fun registerCircuitBreakerResult(success: Boolean, durationMs: Long, error: Throwable?) {
+        when {
+            success -> circuitBreaker.onSuccess(durationMs, TimeUnit.MILLISECONDS)
+            error is CallNotPermittedException -> Unit
+            else -> circuitBreaker.onError(durationMs, TimeUnit.MILLISECONDS, error ?: RuntimeException("External payment failed"))
         }
     }
 
