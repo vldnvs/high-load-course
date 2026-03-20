@@ -70,6 +70,13 @@ class PaymentExternalSystemAdapterImpl(
         .version(HttpClient.Version.HTTP_2)
         .build()
 
+    private val retryScheduler: ScheduledExecutorService = Executors.newScheduledThreadPool(32) { runnable ->
+        val thread = Thread(runnable)
+        thread.isDaemon = true
+        thread.name = "payment-retry-$accountName"
+        thread
+    }
+
     private val hedgeScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
         val thread = Thread(runnable)
         thread.isDaemon = true
@@ -86,26 +93,26 @@ class PaymentExternalSystemAdapterImpl(
         (requestAverageProcessingTime.toMillis() * 0.65).toLong(),
         1_000L
     )
-    private val maxAttempts = 2
-    private val maxDelayMs = 5L
-    private val delayBaseMs = 1L
+    private val maxAttempts = 5
+    private val maxDelayMs = 250L
+    private val delayBaseMs = 25L
     private val hedgeDelayMs = 50L
     private val maxHedgeRequests = 6
     private val hedgeTimeoutReserveMs = 50L
     private val hedgedRequestEnabled = requestAverageProcessingTime.toMillis() >= 1_000L
-    private val circuitBreakerRetryDelayMs = 50L
+    private val circuitBreakerRetryDelayMs = 500L
 
     private val circuitBreaker: CircuitBreaker = CircuitBreaker.of(
         "payment-cb-$accountName",
         CircuitBreakerConfig.custom()
-            .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
-            .slidingWindowSize(100)
-            .minimumNumberOfCalls(50)
-            .failureRateThreshold(50f)
-            .slowCallRateThreshold(80f)
-            .slowCallDurationThreshold(Duration.ofSeconds(2))
-            .waitDurationInOpenState(Duration.ofMillis(100))
-            .permittedNumberOfCallsInHalfOpenState(20)
+            .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.TIME_BASED)
+            .slidingWindowSize(20)
+            .minimumNumberOfCalls(60)
+            .failureRateThreshold(55f)
+            .slowCallRateThreshold(60f)
+            .slowCallDurationThreshold(Duration.ofMillis(500))
+            .waitDurationInOpenState(Duration.ofSeconds(4))
+            .permittedNumberOfCallsInHalfOpenState(6)
             .build()
     )
 
@@ -167,6 +174,7 @@ class PaymentExternalSystemAdapterImpl(
 
         val request = HttpRequest.newBuilder()
             .uri(URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
+            .timeout(Duration.ofMillis(1_800))
             .POST(HttpRequest.BodyPublishers.noBody())
             .build()
 
@@ -186,26 +194,15 @@ class PaymentExternalSystemAdapterImpl(
 
             // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
             // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-            paymentESService.update(paymentId) {
-                it.logProcessing(body.result, now(), transactionId, reason = body.message)
-            }
-
             if (body.result) {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(true, now(), transactionId, reason = body.message)
+                }
                 paymentSuccessCounter.increment()
                 releasePermitOnce(permitReleased)
             } else {
-                paymentErrorCounter.increment()
-                if (attempt > 1) {
-                    paymentRetryCounter.increment()
-                }
                 releasePermitOnce(permitReleased)
-                val currentDelay = exponentialBackoffDelay(attempt)
-                val remainingTime = deadline - now()
-                val sleepTime = min(currentDelay, remainingTime - 10)
-                if (sleepTime > 0) {
-                    Thread.sleep(sleepTime)
-                    performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
-                }
+                retryOrFinalize(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt, body.message)
             }
 
         }.exceptionally { ex ->
@@ -213,27 +210,14 @@ class PaymentExternalSystemAdapterImpl(
             when (ex) {
                 is SocketTimeoutException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", ex)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                    }
+                    releasePermitOnce(permitReleased)
+                    retryOrFinalize(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt, "Request timeout.")
                 }
                 else -> {
                     logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", ex)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = ex.message)
-                    }
+                    releasePermitOnce(permitReleased)
+                    retryOrFinalize(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt, ex.message)
                 }
-            }
-            if (attempt > 1) {
-                paymentRetryCounter.increment()
-            }
-            releasePermitOnce(permitReleased)
-            val currentDelay = exponentialBackoffDelay(attempt)
-            val remainingTime = deadline - now()
-            val sleepTime = min(currentDelay, remainingTime - 10)
-            if (sleepTime > 0) {
-                Thread.sleep(sleepTime)
-                performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
             }
             null
         }
@@ -361,8 +345,35 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         paymentRetryCounter.increment()
-        Thread.sleep(circuitBreakerRetryDelayMs)
-        performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt)
+        scheduleRetry(circuitBreakerRetryDelayMs) {
+            performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt)
+        }
+    }
+
+    private fun retryOrFinalize(
+        paymentId: UUID,
+        amount: Int,
+        transactionId: UUID,
+        paymentStartedAt: Long,
+        deadline: Long,
+        attempt: Int,
+        reason: String?
+    ) {
+        val currentDelay = exponentialBackoffDelay(attempt)
+        val remainingTime = deadline - now()
+        val retryDelay = min(currentDelay, remainingTime - 100)
+        if (attempt < maxAttempts && retryDelay > 0) {
+            paymentRetryCounter.increment()
+            scheduleRetry(retryDelay) {
+                performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
+            }
+            return
+        }
+
+        paymentErrorCounter.increment()
+        paymentESService.update(paymentId) {
+            it.logProcessing(false, now(), transactionId, reason = reason ?: "Payment failed")
+        }
     }
 
     private fun registerCircuitBreakerResult(success: Boolean, durationMs: Long, error: Throwable?) {
@@ -376,8 +387,13 @@ class PaymentExternalSystemAdapterImpl(
     private fun buildPaymentRequest(paymentId: UUID, amount: Int, transactionId: UUID): HttpRequest {
         return HttpRequest.newBuilder()
             .uri(URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
+            .timeout(Duration.ofMillis(1_800))
             .POST(HttpRequest.BodyPublishers.noBody())
             .build()
+    }
+
+    private fun scheduleRetry(delayMs: Long, task: () -> Unit) {
+        retryScheduler.schedule(task, delayMs, TimeUnit.MILLISECONDS)
     }
 
     private fun exponentialBackoffDelay(attempt: Int): Long {
