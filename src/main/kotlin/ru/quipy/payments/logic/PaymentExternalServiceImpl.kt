@@ -80,14 +80,15 @@ class PaymentExternalSystemAdapterImpl(
     )
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val estimatedProcessingTimeMs = min(
-        (requestAverageProcessingTime.toMillis() * 0.75).toLong(),
-        1_200L
+        (requestAverageProcessingTime.toMillis() * 0.65).toLong(),
+        1_000L
     )
     private val maxAttempts = 2
     private val maxDelayMs = 5L
     private val delayBaseMs = 1L
-    private val hedgeDelayMs = 100L
-    private val hedgeTimeoutReserveMs = 10L
+    private val hedgeDelayMs = 50L
+    private val maxHedgeRequests = 6
+    private val hedgeTimeoutReserveMs = 50L
     private val hedgedRequestEnabled = requestAverageProcessingTime.toMillis() >= 1_000L
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -263,22 +264,24 @@ class PaymentExternalSystemAdapterImpl(
 
         sendHedgedAttempt(request, paymentId, transactionId, completed, primaryReleased)
 
-        val hedgeDelay = min(hedgeDelayMs, max(0L, deadline - now() - hedgeTimeoutReserveMs))
-        if (hedgeDelay <= 0) {
-            return
-        }
+        for (hedgeIndex in 1 until maxHedgeRequests) {
+            val hedgeDelay = hedgeIndex * hedgeDelayMs
+            if (hedgeDelay >= max(0L, deadline - now() - hedgeTimeoutReserveMs)) {
+                break
+            }
 
-        hedgeScheduler.schedule(
-            {
-                if (!completed.get() && slidingWindowRateLimiter.tick() && semaphore.tryAcquire()) {
-                    paymentRetryCounter.increment()
-                    val hedgeReleased = AtomicBoolean(false)
-                    sendHedgedAttempt(request, paymentId, transactionId, completed, hedgeReleased)
-                }
-            },
-            hedgeDelay,
-            TimeUnit.MILLISECONDS
-        )
+            hedgeScheduler.schedule(
+                {
+                    if (!completed.get() && slidingWindowRateLimiter.tick() && semaphore.tryAcquire()) {
+                        paymentRetryCounter.increment()
+                        val hedgeReleased = AtomicBoolean(false)
+                        sendHedgedAttempt(request, paymentId, transactionId, completed, hedgeReleased)
+                    }
+                },
+                hedgeDelay,
+                TimeUnit.MILLISECONDS
+            )
+        }
     }
 
     private fun sendHedgedAttempt(
