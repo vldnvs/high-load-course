@@ -70,9 +70,13 @@ class PaymentExternalSystemAdapterImpl(
         window = Duration.ofSeconds(1)
     )
     private val requestAverageProcessingTime = properties.averageProcessingTime
-    private val maxAttempts = 6
-    private val maxDelayMs = 20L
-    private val delayBaseMs = requestAverageProcessingTime.toMillis().coerceIn(3L, 5L)
+    private val estimatedProcessingTimeMs = min(
+        (requestAverageProcessingTime.toMillis() * 0.75).toLong(),
+        1_200L
+    )
+    private val maxAttempts = 2
+    private val maxDelayMs = 5L
+    private val delayBaseMs = 1L
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -94,7 +98,7 @@ class PaymentExternalSystemAdapterImpl(
         deadline: Long,
         attempt: Int
     ) {
-        if (now() + requestAverageProcessingTime.toMillis() > deadline || attempt > maxAttempts) {
+        if (now() + estimatedProcessingTimeMs > deadline || attempt > maxAttempts) {
             paymentErrorCounter.increment()
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded or max attempts reached")
