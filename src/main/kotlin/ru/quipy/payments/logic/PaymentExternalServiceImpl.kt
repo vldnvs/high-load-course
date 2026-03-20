@@ -100,19 +100,19 @@ class PaymentExternalSystemAdapterImpl(
     private val maxHedgeRequests = 6
     private val hedgeTimeoutReserveMs = 50L
     private val hedgedRequestEnabled = requestAverageProcessingTime.toMillis() >= 1_000L
-    private val circuitBreakerRetryDelayMs = 250L
+    private val circuitBreakerRetryDelayMs = 100L
 
     private val circuitBreaker: CircuitBreaker = CircuitBreaker.of(
         "payment-cb-$accountName",
         CircuitBreakerConfig.custom()
-            .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
-            .slidingWindowSize(200)
-            .minimumNumberOfCalls(100)
-            .failureRateThreshold(70f)
-            .slowCallRateThreshold(100f)
-            .slowCallDurationThreshold(Duration.ofSeconds(2))
-            .waitDurationInOpenState(Duration.ofSeconds(2))
-            .permittedNumberOfCallsInHalfOpenState(10)
+            .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.TIME_BASED)
+            .slidingWindowSize(10)
+            .minimumNumberOfCalls(40)
+            .failureRateThreshold(65f)
+            .slowCallRateThreshold(75f)
+            .slowCallDurationThreshold(Duration.ofMillis(750))
+            .waitDurationInOpenState(Duration.ofSeconds(1))
+            .permittedNumberOfCallsInHalfOpenState(12)
             .build()
     )
 
