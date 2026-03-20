@@ -17,8 +17,10 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
 
@@ -65,6 +67,13 @@ class PaymentExternalSystemAdapterImpl(
         .version(HttpClient.Version.HTTP_2)
         .build()
 
+    private val hedgeScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
+        val thread = Thread(runnable)
+        thread.isDaemon = true
+        thread.name = "payment-hedge-$accountName"
+        thread
+    }
+
     val slidingWindowRateLimiter = SlidingWindowRateLimiter(
         rate = properties.rateLimitPerSec.toLong(),
         window = Duration.ofSeconds(1)
@@ -77,6 +86,9 @@ class PaymentExternalSystemAdapterImpl(
     private val maxAttempts = 2
     private val maxDelayMs = 5L
     private val delayBaseMs = 1L
+    private val hedgeDelayMs = 100L
+    private val hedgeTimeoutReserveMs = 10L
+    private val hedgedRequestEnabled = requestAverageProcessingTime.toMillis() >= 1_000L
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -98,6 +110,11 @@ class PaymentExternalSystemAdapterImpl(
         deadline: Long,
         attempt: Int
     ) {
+        if (hedgedRequestEnabled && attempt == 1) {
+            performHedgedRequest(paymentId, amount, transactionId, deadline)
+            return
+        }
+
         if (now() + estimatedProcessingTimeMs > deadline || attempt > maxAttempts) {
             paymentErrorCounter.increment()
             paymentESService.update(paymentId) {
@@ -193,6 +210,112 @@ class PaymentExternalSystemAdapterImpl(
             }
             null
         }
+    }
+
+    private fun performHedgedRequest(
+        paymentId: UUID,
+        amount: Int,
+        transactionId: UUID,
+        deadline: Long
+    ) {
+        if (now() + estimatedProcessingTimeMs > deadline) {
+            paymentErrorCounter.increment()
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded before hedged request start")
+            }
+            return
+        }
+
+        if (!slidingWindowRateLimiter.tickBlocking(Duration.ofMillis(deadline - now()))) {
+            paymentErrorCounter.increment()
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Rate limit exceed")
+            }
+            return
+        }
+
+        val acquired = semaphore.tryAcquire(deadline - now(), TimeUnit.MILLISECONDS)
+        if (!acquired) {
+            paymentErrorCounter.increment()
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Semaphore timeout")
+            }
+            return
+        }
+
+        val completed = AtomicBoolean(false)
+        val primaryReleased = AtomicBoolean(false)
+        val request = buildPaymentRequest(paymentId, amount, transactionId)
+
+        val remainingToDeadline = max(1L, deadline - now())
+        hedgeScheduler.schedule(
+            {
+                if (completed.compareAndSet(false, true)) {
+                    paymentErrorCounter.increment()
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded")
+                    }
+                }
+            },
+            remainingToDeadline,
+            TimeUnit.MILLISECONDS
+        )
+
+        sendHedgedAttempt(request, paymentId, transactionId, completed, primaryReleased)
+
+        val hedgeDelay = min(hedgeDelayMs, max(0L, deadline - now() - hedgeTimeoutReserveMs))
+        if (hedgeDelay <= 0) {
+            return
+        }
+
+        hedgeScheduler.schedule(
+            {
+                if (!completed.get() && slidingWindowRateLimiter.tick() && semaphore.tryAcquire()) {
+                    paymentRetryCounter.increment()
+                    val hedgeReleased = AtomicBoolean(false)
+                    sendHedgedAttempt(request, paymentId, transactionId, completed, hedgeReleased)
+                }
+            },
+            hedgeDelay,
+            TimeUnit.MILLISECONDS
+        )
+    }
+
+    private fun sendHedgedAttempt(
+        request: HttpRequest,
+        paymentId: UUID,
+        transactionId: UUID,
+        completed: AtomicBoolean,
+        released: AtomicBoolean
+    ) {
+        client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).thenApply { response ->
+            val body = try {
+                mapper.readValue(response.body(), ExternalSysResponse::class.java)
+            } catch (e: Exception) {
+                logger.error("[$accountName] [ERROR] Hedged payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}")
+                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+            }
+
+            if (body.result && completed.compareAndSet(false, true)) {
+                paymentSuccessCounter.increment()
+                paymentESService.update(paymentId) {
+                    it.logProcessing(true, now(), transactionId, reason = body.message)
+                }
+            }
+
+            releasePermitOnce(released)
+        }.exceptionally { ex ->
+            logger.error("[$accountName] Hedged payment failed for txId: $transactionId, payment: $paymentId", ex)
+            releasePermitOnce(released)
+            null
+        }
+    }
+
+    private fun buildPaymentRequest(paymentId: UUID, amount: Int, transactionId: UUID): HttpRequest {
+        return HttpRequest.newBuilder()
+            .uri(URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
+            .POST(HttpRequest.BodyPublishers.noBody())
+            .build()
     }
 
     private fun exponentialBackoffDelay(attempt: Int): Long {
