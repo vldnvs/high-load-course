@@ -1,7 +1,5 @@
 package ru.quipy.payments.logic
 
-import io.micrometer.core.instrument.Gauge
-import io.micrometer.core.instrument.Metrics
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -31,6 +29,9 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
+    @Autowired
+    private lateinit var paymentAccounts: List<PaymentExternalSystemAdapter>
+
     private val queue = LinkedBlockingQueue<Runnable>(8_000)
 
     private val paymentExecutor = ThreadPoolExecutor(
@@ -43,7 +44,14 @@ class OrderPayer {
         CallerBlockingRejectedExecutionHandler()
     )
 
-    private val slidingWindowRateLimiter = SlidingWindowRateLimiter(1100, Duration.ofSeconds(1))
+    private val slidingWindowRateLimiter by lazy {
+        val totalRate = paymentAccounts
+            .filter { it.isEnabled() }
+            .sumOf { it.rateLimitPerSec() }
+            .coerceAtLeast(1)
+
+        SlidingWindowRateLimiter(totalRate.toLong(), Duration.ofSeconds(1))
+    }
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
@@ -53,18 +61,18 @@ class OrderPayer {
             throw RateLimitException()
         }
 
-            paymentExecutor.submit {
-                val createdEvent = paymentESService.create {
-                    it.create(
-                        paymentId,
-                        orderId,
-                        amount
-                    )
-                }
-                logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
-
-                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+        paymentExecutor.submit {
+            val createdEvent = paymentESService.create {
+                it.create(
+                    paymentId,
+                    orderId,
+                    amount
+                )
             }
+            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+
+            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+        }
 
         return createdAt
     }
