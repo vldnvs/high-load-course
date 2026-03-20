@@ -70,9 +70,9 @@ class PaymentExternalSystemAdapterImpl(
         window = Duration.ofSeconds(1)
     )
     private val requestAverageProcessingTime = properties.averageProcessingTime
-    private val maxAttempts = 50
-    private val maxDelayMs = 50L
-    private val delayBaseMs = requestAverageProcessingTime.toMillis().coerceIn(5L, 10L)
+    private val maxAttempts = 6
+    private val maxDelayMs = 20L
+    private val delayBaseMs = requestAverageProcessingTime.toMillis().coerceIn(3L, 5L)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
