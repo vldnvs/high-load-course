@@ -17,10 +17,8 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
 
@@ -67,26 +65,14 @@ class PaymentExternalSystemAdapterImpl(
         .version(HttpClient.Version.HTTP_2)
         .build()
 
-    private val retryScheduler: ScheduledExecutorService = Executors.newScheduledThreadPool(
-        4,
-        { runnable ->
-            val thread = Thread(runnable)
-            thread.isDaemon = true
-            thread.name = "payment-retry-$accountName"
-            thread
-        }
-    )
-
     val slidingWindowRateLimiter = SlidingWindowRateLimiter(
         rate = properties.rateLimitPerSec.toLong(),
         window = Duration.ofSeconds(1)
     )
     private val requestAverageProcessingTime = properties.averageProcessingTime
-    private val maxAttempts = 100
+    private val maxAttempts = 50
     private val maxDelayMs = 50L
     private val delayBaseMs = requestAverageProcessingTime.toMillis().coerceIn(5L, 10L)
-    private val schedulingSlackMs = 20L
-    private val retrySafetyMarginMs = max(50L, requestAverageProcessingTime.toMillis() * 2)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -108,7 +94,7 @@ class PaymentExternalSystemAdapterImpl(
         deadline: Long,
         attempt: Int
     ) {
-        if (!canStartAttempt(deadline, attempt)) {
+        if (now() + requestAverageProcessingTime.toMillis() > deadline || attempt > maxAttempts) {
             paymentErrorCounter.increment()
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded or max attempts reached")
@@ -116,16 +102,7 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        val timeLeftForAcquire = timeLeftForAcquire(deadline)
-        if (timeLeftForAcquire <= 0) {
-            paymentErrorCounter.increment()
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded before request scheduling")
-            }
-            return
-        }
-
-        if (!slidingWindowRateLimiter.tickBlocking(Duration.ofMillis(timeLeftForAcquire))) {
+        if (!slidingWindowRateLimiter.tickBlocking(Duration.ofMillis(deadline - now()))) {
             paymentErrorCounter.increment()
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "Rate limit exceed")
@@ -133,16 +110,7 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        val timeToBlock = timeLeftForAcquire(deadline)
-        if (timeToBlock <= 0) {
-            paymentErrorCounter.increment()
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded before semaphore acquire")
-            }
-            return
-        }
-
-        val acquired = semaphore.tryAcquire(timeToBlock, TimeUnit.MILLISECONDS)
+        val acquired = semaphore.tryAcquire(deadline - now(), TimeUnit.MILLISECONDS)
         if (!acquired) {
             logger.warn("[$accountName] Timeout acquiring semaphore for payment $paymentId")
             paymentErrorCounter.increment()
@@ -180,8 +148,17 @@ class PaymentExternalSystemAdapterImpl(
                 releasePermitOnce(permitReleased)
             } else {
                 paymentErrorCounter.increment()
+                if (attempt > 1) {
+                    paymentRetryCounter.increment()
+                }
                 releasePermitOnce(permitReleased)
-                scheduleRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt, body.message)
+                val currentDelay = exponentialBackoffDelay(attempt)
+                val remainingTime = deadline - now()
+                val sleepTime = min(currentDelay, remainingTime - 10)
+                if (sleepTime > 0) {
+                    Thread.sleep(sleepTime)
+                    performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
+                }
             }
 
         }.exceptionally { ex ->
@@ -199,60 +176,23 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+            if (attempt > 1) {
+                paymentRetryCounter.increment()
+            }
             releasePermitOnce(permitReleased)
-            scheduleRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt, ex.message)
+            val currentDelay = exponentialBackoffDelay(attempt)
+            val remainingTime = deadline - now()
+            val sleepTime = min(currentDelay, remainingTime - 10)
+            if (sleepTime > 0) {
+                Thread.sleep(sleepTime)
+                performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
+            }
             null
         }
     }
 
     private fun exponentialBackoffDelay(attempt: Int): Long {
         return minOf((delayBaseMs * 2.0.pow((attempt - 1).toDouble())).toLong(), maxDelayMs)
-    }
-
-    private fun canStartAttempt(deadline: Long, attempt: Int): Boolean {
-        if (attempt > maxAttempts) {
-            return false
-        }
-
-        return now() + requestAverageProcessingTime.toMillis() + retrySafetyMarginMs < deadline
-    }
-
-    private fun timeLeftForAcquire(deadline: Long): Long {
-        return deadline - now() - retrySafetyMarginMs
-    }
-
-    private fun scheduleRetry(
-        paymentId: UUID,
-        amount: Int,
-        transactionId: UUID,
-        paymentStartedAt: Long,
-        deadline: Long,
-        attempt: Int,
-        reason: String?
-    ) {
-        val nextAttempt = attempt + 1
-        if (!canStartAttempt(deadline, nextAttempt)) {
-            return
-        }
-
-        if (attempt >= 1) {
-            paymentRetryCounter.increment()
-        }
-
-        val currentDelay = exponentialBackoffDelay(attempt)
-        val remainingTime = deadline - now() - retrySafetyMarginMs
-        val delay = min(currentDelay, remainingTime - schedulingSlackMs)
-        if (delay <= 0) {
-            performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, nextAttempt)
-            return
-        }
-
-        logger.debug("[$accountName] Scheduling retry for payment $paymentId in ${delay}ms, reason=$reason")
-        retryScheduler.schedule(
-            { performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, nextAttempt) },
-            delay,
-            TimeUnit.MILLISECONDS
-        )
     }
 
     private fun releasePermitOnce(released: AtomicBoolean) {
@@ -266,8 +206,6 @@ class PaymentExternalSystemAdapterImpl(
     override fun isEnabled() = properties.enabled
 
     override fun name() = properties.accountName
-
-    override fun rateLimitPerSec() = properties.rateLimitPerSec
 }
 
 public fun now() = System.currentTimeMillis()

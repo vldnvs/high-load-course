@@ -29,14 +29,11 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    @Autowired
-    private lateinit var paymentAccounts: List<PaymentExternalSystemAdapter>
-
-    private val queue = LinkedBlockingQueue<Runnable>(8_000)
+    private val queue = LinkedBlockingQueue<Runnable>(20_000)
 
     private val paymentExecutor = ThreadPoolExecutor(
-        200,
-        1200,
+        600,
+        2000,
         60L,
         TimeUnit.SECONDS,
         queue,
@@ -44,14 +41,7 @@ class OrderPayer {
         CallerBlockingRejectedExecutionHandler()
     )
 
-    private val slidingWindowRateLimiter by lazy {
-        val totalRate = paymentAccounts
-            .filter { it.isEnabled() }
-            .sumOf { it.rateLimitPerSec() }
-            .coerceAtLeast(1)
-
-        SlidingWindowRateLimiter(totalRate.toLong(), Duration.ofSeconds(1))
-    }
+    private val slidingWindowRateLimiter = SlidingWindowRateLimiter(5000, Duration.ofSeconds(1))
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
