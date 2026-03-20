@@ -18,6 +18,7 @@ import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.min
 import kotlin.math.pow
 
@@ -55,8 +56,12 @@ class PaymentExternalSystemAdapterImpl(
         .tag("adapter", "payment")
         .register(Metrics.globalRegistry)
 
+    private val clientExecutorThreads = properties.parallelRequests
+        .coerceAtMost(512)
+        .coerceAtLeast(128)
+
     private val client = HttpClient.newBuilder()
-        .executor(Executors.newFixedThreadPool(100))
+        .executor(Executors.newFixedThreadPool(clientExecutorThreads))
         .version(HttpClient.Version.HTTP_2)
         .build()
 
@@ -65,9 +70,9 @@ class PaymentExternalSystemAdapterImpl(
         window = Duration.ofSeconds(1)
     )
     private val requestAverageProcessingTime = properties.averageProcessingTime
-    private val maxAttempts = 10
-    private val maxDelayMs = 20000L
-    private val delayBaseMs = 500L
+    private val maxAttempts = 6
+    private val maxDelayMs = 20L
+    private val delayBaseMs = requestAverageProcessingTime.toMillis().coerceIn(3L, 5L)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -105,8 +110,7 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        val timeToBlock = deadline - System.currentTimeMillis()
-        val acquired = semaphore.tryAcquire(timeToBlock, TimeUnit.MILLISECONDS)
+        val acquired = semaphore.tryAcquire(deadline - now(), TimeUnit.MILLISECONDS)
         if (!acquired) {
             logger.warn("[$accountName] Timeout acquiring semaphore for payment $paymentId")
             paymentErrorCounter.increment()
@@ -122,6 +126,7 @@ class PaymentExternalSystemAdapterImpl(
             .build()
 
         val startTime = now()
+        val permitReleased = AtomicBoolean(false)
         client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).thenApply { response ->
             val body = try {
                 mapper.readValue(response.body(), ExternalSysResponse::class.java)
@@ -140,16 +145,16 @@ class PaymentExternalSystemAdapterImpl(
 
             if (body.result) {
                 paymentSuccessCounter.increment()
-                semaphore.release()
+                releasePermitOnce(permitReleased)
             } else {
                 paymentErrorCounter.increment()
                 if (attempt > 1) {
                     paymentRetryCounter.increment()
                 }
-                semaphore.release()
+                releasePermitOnce(permitReleased)
                 val currentDelay = exponentialBackoffDelay(attempt)
                 val remainingTime = deadline - now()
-                val sleepTime = min(currentDelay, remainingTime - 50)
+                val sleepTime = min(currentDelay, remainingTime - 10)
                 if (sleepTime > 0) {
                     Thread.sleep(sleepTime)
                     performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
@@ -174,18 +179,26 @@ class PaymentExternalSystemAdapterImpl(
             if (attempt > 1) {
                 paymentRetryCounter.increment()
             }
+            releasePermitOnce(permitReleased)
             val currentDelay = exponentialBackoffDelay(attempt)
             val remainingTime = deadline - now()
-            val sleepTime = min(currentDelay, remainingTime - 50)
+            val sleepTime = min(currentDelay, remainingTime - 10)
             if (sleepTime > 0) {
                 Thread.sleep(sleepTime)
                 performRequestWithRetry(paymentId, amount, transactionId, paymentStartedAt, deadline, attempt + 1)
             }
+            null
         }
     }
 
     private fun exponentialBackoffDelay(attempt: Int): Long {
         return minOf((delayBaseMs * 2.0.pow((attempt - 1).toDouble())).toLong(), maxDelayMs)
+    }
+
+    private fun releasePermitOnce(released: AtomicBoolean) {
+        if (released.compareAndSet(false, true)) {
+            semaphore.release()
+        }
     }
 
     override fun price() = properties.price
